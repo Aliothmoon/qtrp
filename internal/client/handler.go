@@ -1,0 +1,68 @@
+package client
+
+import (
+	"io"
+	"log"
+	"net"
+	"sync"
+
+	"qtrp/pkg/pool"
+)
+
+// Join 双向转发两个连接
+func Join(c1, c2 net.Conn) {
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	go func() {
+		defer wg.Done()
+		defer c1.Close()
+		n, err := copyBuffer(c1, c2)
+		if err != nil && err != io.EOF {
+			log.Printf("[client] copy c2->c1 error after %d bytes: %v", n, err)
+		}
+	}()
+
+	go func() {
+		defer wg.Done()
+		defer c2.Close()
+		n, err := copyBuffer(c2, c1)
+		if err != nil && err != io.EOF {
+			log.Printf("[client] copy c1->c2 error after %d bytes: %v", n, err)
+		}
+	}()
+
+	wg.Wait()
+}
+
+// copyBuffer 使用缓冲池进行数据复制
+func copyBuffer(dst, src net.Conn) (int64, error) {
+	buf := pool.DefaultBufferPool.Get()
+	defer pool.DefaultBufferPool.Put(buf)
+
+	var total int64
+	for {
+		n, err := src.Read(*buf)
+		if n > 0 {
+			wn, werr := dst.Write((*buf)[:n])
+			if wn > 0 {
+				total += int64(wn)
+			}
+			if werr != nil {
+				log.Printf("[client] write error after %d total bytes: %v", total, werr)
+				return total, werr
+			}
+			if wn != n {
+				log.Printf("[client] short write: wrote %d of %d bytes", wn, n)
+				return total, io.ErrShortWrite
+			}
+		}
+		if err != nil {
+			if err == io.EOF {
+				return total, nil
+			}
+			log.Printf("[client] read error after %d total bytes: %v", total, err)
+			return total, err
+		}
+	}
+}

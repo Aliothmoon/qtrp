@@ -1,0 +1,41 @@
+# QTRP 服务端配置
+
+# 控制连接监听地址
+bind_addr: "0.0.0.0:7000"
+
+# Dashboard 监听地址 (留空禁用)
+dashboard_addr: "0.0.0.0:7500"
+
+# 传输层: net | gnet | quic
+# - net: 标准 TCP (默认)
+# - gnet: 高性能事件驱动 TCP
+# - quic: QUIC 协议 (UDP, 内置 TLS 1.3 加密+多路复用)
+transport: "net"
+
+# 加密方式: tls | chacha20 | none
+# 注意: transport=quic 时此选项被忽略 (QUIC 自带加密)
+crypto: "tls"
+
+# TLS 配置 (crypto=tls 时使用)
+tls:
+  cert_file: "./certs/server.crt"
+  key_file: "./certs/server.key"
+
+# ChaCha20 配置 (crypto=chacha20 时使用)
+chacha20:
+  psk: "your-pre-shared-key-32bytes!!"
+
+# QUIC 配置 (transport=quic 时使用)
+quic:
+  # 证书文件路径 (留空则启动时自动生成自签名证书)
+  cert_file: ""
+  key_file: ""
+  # 如需持久化证书，可指定路径:
+  # cert_file: "./certs/quic.crt"
+  # key_file: "./certs/quic.key"
+
+# 认证配置
+auth:
+  tokens:
+    - "my-secret-token-1"
+    - "my-secret-token-2"
