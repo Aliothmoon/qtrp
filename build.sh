@@ -12,8 +12,8 @@ mkdir -p ${BUILD_DIR}
 # 构建目标平台
 PLATFORMS=(
     "linux/amd64"
-#    "linux/arm64"
-#    "windows/amd64"
+    "linux/arm64"
+    "windows/amd64"
 )
 
 for PLATFORM in "${PLATFORMS[@]}"; do
@@ -56,4 +56,4 @@ done
 
 echo ""
 echo "Build complete! Output:"
-ls -la ${BUILD_DIR}/*.{tar.gz,zip} 2>/dev/null
+ls -lh ${BUILD_DIR}/ | grep -E 'qtrp-'
