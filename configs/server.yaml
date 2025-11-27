@@ -18,8 +18,12 @@ crypto: "tls"
 
 # TLS 配置 (crypto=tls 时使用)
 tls:
-  cert_file: "./certs/server.crt"
-  key_file: "./certs/server.key"
+  # 证书文件路径 (留空则启动时自动生成自签名证书)
+  cert_file: ""
+  key_file: ""
+  # 如需使用已有证书或持久化证书，可指定路径:
+  # cert_file: "./certs/server.crt"
+  # key_file: "./certs/server.key"
 
 # ChaCha20 配置 (crypto=chacha20 时使用)
 chacha20:

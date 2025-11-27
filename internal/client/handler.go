@@ -4,10 +4,22 @@ import (
 	"io"
 	"log"
 	"net"
+	"strings"
 	"sync"
 
 	"qtrp/pkg/pool"
 )
+
+// isClosedConnError 判断是否是连接已关闭的错误（正常关闭场景）
+func isClosedConnError(err error) bool {
+	if err == nil {
+		return false
+	}
+	errStr := err.Error()
+	return strings.Contains(errStr, "use of closed network connection") ||
+		strings.Contains(errStr, "connection reset by peer") ||
+		strings.Contains(errStr, "broken pipe")
+}
 
 // Join 双向转发两个连接
 func Join(c1, c2 net.Conn) {
@@ -18,7 +30,7 @@ func Join(c1, c2 net.Conn) {
 		defer wg.Done()
 		defer c1.Close()
 		n, err := copyBuffer(c1, c2)
-		if err != nil && err != io.EOF {
+		if err != nil && err != io.EOF && !isClosedConnError(err) {
 			log.Printf("[client] copy c2->c1 error after %d bytes: %v", n, err)
 		}
 	}()
@@ -27,7 +39,7 @@ func Join(c1, c2 net.Conn) {
 		defer wg.Done()
 		defer c2.Close()
 		n, err := copyBuffer(c2, c1)
-		if err != nil && err != io.EOF {
+		if err != nil && err != io.EOF && !isClosedConnError(err) {
 			log.Printf("[client] copy c1->c2 error after %d bytes: %v", n, err)
 		}
 	}()
@@ -49,7 +61,9 @@ func copyBuffer(dst, src net.Conn) (int64, error) {
 				total += int64(wn)
 			}
 			if werr != nil {
-				log.Printf("[client] write error after %d total bytes: %v", total, werr)
+				if !isClosedConnError(werr) {
+					log.Printf("[client] write error after %d total bytes: %v", total, werr)
+				}
 				return total, werr
 			}
 			if wn != n {
@@ -61,7 +75,9 @@ func copyBuffer(dst, src net.Conn) (int64, error) {
 			if err == io.EOF {
 				return total, nil
 			}
-			log.Printf("[client] read error after %d total bytes: %v", total, err)
+			if !isClosedConnError(err) {
+				log.Printf("[client] read error after %d total bytes: %v", total, err)
+			}
 			return total, err
 		}
 	}

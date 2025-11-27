@@ -54,6 +54,7 @@ type Proxy struct {
 // New 创建服务端
 func New(cfg *config.ServerConfig) *Server {
 	var trans transport.Transport
+	var crypt crypto.Crypto
 
 	// QUIC 传输层需要在启动时生成证书
 	if cfg.Transport == "quic" {
@@ -71,20 +72,35 @@ func New(cfg *config.ServerConfig) *Server {
 		trans = transport.NewWithQUICConfig("quic", &transport.QUICConfig{
 			TLSConfig: certMgr.GetServerTLSConfig(),
 		})
-	} else {
-		trans = transport.New(cfg.Transport)
-	}
-
-	// QUIC 自带加密，不需要额外加密层
-	var crypt crypto.Crypto
-	if cfg.Transport == "quic" {
+		// QUIC 自带加密，不需要额外加密层
 		crypt = crypto.New("none", nil)
 	} else {
-		crypt = crypto.New(cfg.Crypto, &crypto.Config{
-			CertFile: cfg.TLS.CertFile,
-			KeyFile:  cfg.TLS.KeyFile,
-			PSK:      cfg.ChaCha20.PSK,
-		})
+		trans = transport.New(cfg.Transport)
+
+		// TLS 加密模式：如果证书文件为空，使用证书管理器自动生成
+		if cfg.Crypto == "tls" && (cfg.TLS.CertFile == "" || cfg.TLS.KeyFile == "") {
+			certMgr, err := crypto.NewCertManager(&crypto.CertConfig{
+				CertFile:     cfg.TLS.CertFile,
+				KeyFile:      cfg.TLS.KeyFile,
+				Organization: "QTRP",
+				CommonName:   "qtrp-server",
+			})
+			if err != nil {
+				log.Fatalf("[server] create certificate manager error: %v", err)
+			}
+			log.Printf("[server] TLS certificate auto-generated (self-signed)")
+			crypt = crypto.NewTLSCryptoWithCertManager(&crypto.Config{
+				CertFile: cfg.TLS.CertFile,
+				KeyFile:  cfg.TLS.KeyFile,
+			}, certMgr)
+		} else {
+			// 使用标准加密配置
+			crypt = crypto.New(cfg.Crypto, &crypto.Config{
+				CertFile: cfg.TLS.CertFile,
+				KeyFile:  cfg.TLS.KeyFile,
+				PSK:      cfg.ChaCha20.PSK,
+			})
+		}
 	}
 
 	return &Server{
@@ -236,8 +252,21 @@ func (s *Server) handleAuth(stream net.Conn, session *mux.Session) (*Client, err
 		return nil, &AuthError{Message: "authentication failed"}
 	}
 
+	clientID := req.Token[:8] + "..."
+
+	// 检查是否有相同 ID 的旧客户端，如果有则清理（客户端重连）
+	if oldClientVal, exists := s.clients.Load(clientID); exists {
+		oldClient := oldClientVal.(*Client)
+		log.Printf("[server] client %s reconnecting, cleaning up old connection", clientID)
+		s.cleanupClient(oldClient)
+		// 关闭旧会话
+		if oldClient.session != nil {
+			oldClient.session.Close()
+		}
+	}
+
 	client := &Client{
-		id:       req.Token[:8] + "...",
+		id:       clientID,
 		session:  session,
 		proxies:  make(map[string]*Proxy),
 		lastPing: time.Now(),
@@ -312,8 +341,11 @@ func (s *Server) handleNewProxy(client *Client, stream net.Conn, msg *protocol.M
 		return
 	}
 
-	// 创建代理监听器
-	ln, err := net.Listen("tcp", ":"+strconv.Itoa(req.RemotePort))
+	// 创建代理监听器（设置端口重用以支持快速重连）
+	lc := net.ListenConfig{
+		Control: pool.SetReuseAddr,
+	}
+	ln, err := lc.Listen(pool.GetContext(), "tcp", ":"+strconv.Itoa(req.RemotePort))
 	if err != nil {
 		log.Printf("[server] client %s listen on port %d error: %v", client.id, req.RemotePort, err)
 		if err := protocol.SendMessage(stream, protocol.MsgTypeNewProxyResp, protocol.NewProxyResponse{

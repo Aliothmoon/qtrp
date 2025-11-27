@@ -19,7 +19,7 @@ token: "my-secret-token-1"
 # TLS 配置 (crypto=tls 时使用)
 tls:
   ca_cert: ""           # CA 证书路径 (留空使用系统证书)
-  skip_verify: false    # 是否跳过证书验证
+  skip_verify: false    # 是否跳过证书验证 (服务端使用自动生成证书时需设为 true)
 
 # ChaCha20 配置 (crypto=chacha20 时使用)
 chacha20:

@@ -3,18 +3,28 @@ package crypto
 import (
 	"crypto/tls"
 	"crypto/x509"
+	"log"
 	"net"
 	"os"
 )
 
 // TLSCrypto TLS 加密实现
 type TLSCrypto struct {
-	config *Config
+	config      *Config
+	certManager *CertManager // 证书管理器（支持自动生成）
 }
 
 // NewTLSCrypto 创建 TLS 加密层
 func NewTLSCrypto(cfg *Config) *TLSCrypto {
 	return &TLSCrypto{config: cfg}
+}
+
+// NewTLSCryptoWithCertManager 使用证书管理器创建 TLS 加密层
+func NewTLSCryptoWithCertManager(cfg *Config, certMgr *CertManager) *TLSCrypto {
+	return &TLSCrypto{
+		config:      cfg,
+		certManager: certMgr,
+	}
 }
 
 func (t *TLSCrypto) Type() string {
@@ -30,14 +40,22 @@ func (t *TLSCrypto) WrapConn(conn net.Conn, isServer bool) (net.Conn, error) {
 }
 
 func (t *TLSCrypto) wrapServer(conn net.Conn) (net.Conn, error) {
-	cert, err := tls.LoadX509KeyPair(t.config.CertFile, t.config.KeyFile)
-	if err != nil {
-		return nil, err
-	}
+	var tlsConfig *tls.Config
 
-	tlsConfig := &tls.Config{
-		Certificates: []tls.Certificate{cert},
-		MinVersion:   tls.VersionTLS12,
+	// 优先使用证书管理器（支持自动生成）
+	if t.certManager != nil {
+		tlsConfig = t.certManager.GetServerTLSConfig()
+		log.Printf("[tls] using certificate manager (auto-generated or loaded)")
+	} else {
+		// 直接加载证书文件
+		cert, err := tls.LoadX509KeyPair(t.config.CertFile, t.config.KeyFile)
+		if err != nil {
+			return nil, err
+		}
+		tlsConfig = &tls.Config{
+			Certificates: []tls.Certificate{cert},
+			MinVersion:   tls.VersionTLS12,
+		}
 	}
 
 	tlsConn := tls.Server(conn, tlsConfig)
@@ -75,14 +93,21 @@ func (t *TLSCrypto) wrapClient(conn net.Conn) (net.Conn, error) {
 
 // WrapListener 包装监听器为 TLS 监听器
 func (t *TLSCrypto) WrapListener(ln net.Listener) (net.Listener, error) {
-	cert, err := tls.LoadX509KeyPair(t.config.CertFile, t.config.KeyFile)
-	if err != nil {
-		return nil, err
-	}
+	var tlsConfig *tls.Config
 
-	tlsConfig := &tls.Config{
-		Certificates: []tls.Certificate{cert},
-		MinVersion:   tls.VersionTLS12,
+	// 优先使用证书管理器（支持自动生成）
+	if t.certManager != nil {
+		tlsConfig = t.certManager.GetServerTLSConfig()
+	} else {
+		// 直接加载证书文件
+		cert, err := tls.LoadX509KeyPair(t.config.CertFile, t.config.KeyFile)
+		if err != nil {
+			return nil, err
+		}
+		tlsConfig = &tls.Config{
+			Certificates: []tls.Certificate{cert},
+			MinVersion:   tls.VersionTLS12,
+		}
 	}
 
 	return tls.NewListener(ln, tlsConfig), nil
