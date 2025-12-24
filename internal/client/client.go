@@ -1,6 +1,7 @@
 package client
 
 import (
+	"context"
 	"io"
 	"log"
 	"net"
@@ -15,6 +16,8 @@ import (
 	"qtrp/pkg/pool"
 	"qtrp/pkg/protocol"
 	"qtrp/pkg/transport"
+
+	"github.com/flben233/mtmux"
 )
 
 // Client 客户端
@@ -22,7 +25,7 @@ type Client struct {
 	config  *config.ClientConfig
 	trans   transport.Transport
 	crypt   crypto.Crypto
-	session *mux.Session
+	session mux.SessionInterface // 使用接口以支持 smux 和 mtmux
 
 	ctrlStream net.Conn
 	proxies    map[string]*config.ExpandedProxy // name -> ExpandedProxy
@@ -35,6 +38,10 @@ type Client struct {
 	// ping-pong 在线检测
 	pongCh      chan struct{} // 接收 pong 响应的通道
 	connCloseCh chan struct{} // 当前连接关闭信号（每次连接时新建）
+
+	// MTMux 相关
+	mtmuxCtx    context.Context    // MTMux session context
+	mtmuxCancel context.CancelFunc // MTMux session cancel function
 }
 
 // New 创建客户端
@@ -138,41 +145,30 @@ func (c *Client) Stop() {
 }
 
 func (c *Client) connect() error {
-	log.Printf("[client] connecting to %s (transport=%s, crypto=%s)",
-		c.config.ServerAddr, c.trans.Type(), c.crypt.Type())
+	log.Printf("[client] connecting to %s (transport=%s, crypto=%s, mtmux=%v)",
+		c.config.ServerAddr, c.trans.Type(), c.crypt.Type(), c.config.MTMux.Enabled)
 
 	// 创建新的 pong 通道和连接关闭通道（每次连接都需要新建）
 	c.pongCh = make(chan struct{}, 1)
 	c.connCloseCh = make(chan struct{})
 
-	// 建立连接
-	conn, err := c.trans.Dial(c.config.ServerAddr)
-	if err != nil {
-		log.Printf("[client] dial server error: %v", err)
-		return err
+	var session mux.SessionInterface
+	var err error
+
+	if c.config.MTMux.Enabled {
+		// MTMux 模式：多隧道连接
+		session, err = c.connectWithMTMux()
+		if err != nil {
+			return err
+		}
+	} else {
+		// 标准模式：单连接 + smux
+		session, err = c.connectStandard()
+		if err != nil {
+			return err
+		}
 	}
 
-	// 优化 TCP 参数
-	if err := pool.OptimizeTCPConn(conn); err != nil {
-		log.Printf("[client] optimize TCP params error: %v", err)
-		// 继续执行，优化失败不影响功能
-	}
-
-	// 加密包装
-	cryptConn, err := c.crypt.WrapConn(conn, false)
-	if err != nil {
-		log.Printf("[client] crypto wrap error: %v", err)
-		conn.Close()
-		return err
-	}
-
-	// 创建多路复用会话
-	session, err := mux.NewClientSession(cryptConn)
-	if err != nil {
-		log.Printf("[client] create mux session error: %v", err)
-		cryptConn.Close()
-		return err
-	}
 	c.session = session
 
 	// 打开控制流
@@ -220,6 +216,12 @@ func (c *Client) connect() error {
 	// 连接已断开，通知 keepalive goroutine 停止
 	close(c.connCloseCh)
 
+	// 取消 MTMux context（如果使用）
+	if c.mtmuxCancel != nil {
+		c.mtmuxCancel()
+		c.mtmuxCancel = nil
+	}
+
 	// 清理资源
 	if c.ctrlStream != nil {
 		c.ctrlStream.Close()
@@ -230,6 +232,112 @@ func (c *Client) connect() error {
 
 	log.Printf("[client] connection closed, preparing to reconnect")
 	return nil
+}
+
+// connectStandard 标准模式连接（单连接 + smux）
+func (c *Client) connectStandard() (mux.SessionInterface, error) {
+	// 建立连接
+	conn, err := c.trans.Dial(c.config.ServerAddr)
+	if err != nil {
+		log.Printf("[client] dial server error: %v", err)
+		return nil, err
+	}
+
+	// 优化 TCP 参数
+	if err := pool.OptimizeTCPConn(conn); err != nil {
+		log.Printf("[client] optimize TCP params error: %v", err)
+		// 继续执行，优化失败不影响功能
+	}
+
+	// 加密包装
+	cryptConn, err := c.crypt.WrapConn(conn, false)
+	if err != nil {
+		log.Printf("[client] crypto wrap error: %v", err)
+		conn.Close()
+		return nil, err
+	}
+
+	// 创建 smux 会话
+	session, err := mux.NewClientSession(cryptConn)
+	if err != nil {
+		log.Printf("[client] create mux session error: %v", err)
+		cryptConn.Close()
+		return nil, err
+	}
+
+	log.Printf("[client] standard mode (smux) connected")
+	return session, nil
+}
+
+// connectWithMTMux MTMux 模式连接（多隧道）
+func (c *Client) connectWithMTMux() (mux.SessionInterface, error) {
+	tunnels := c.config.MTMux.Tunnels
+	log.Printf("[client] dialing %d tunnels to %s", tunnels, c.config.ServerAddr)
+
+	// 连接多个隧道
+	bundle, err := mtmux.Dial("tcp", c.config.ServerAddr, tunnels)
+	if err != nil {
+		log.Printf("[client] mtmux dial error: %v", err)
+		return nil, err
+	}
+
+	log.Printf("[client] %d tunnels connected, applying encryption and TCP optimization", len(bundle))
+
+	// 对每个连接应用 TCP 优化和加密
+	bundle = mtmux.ConnWrapper(bundle, func(conn net.Conn) net.Conn {
+		// 优化 TCP 参数
+		if err := pool.OptimizeTCPConn(conn); err != nil {
+			log.Printf("[client] optimize TCP params error: %v", err)
+		}
+
+		// 加密包装
+		cryptConn, err := c.crypt.WrapConn(conn, false)
+		if err != nil {
+			log.Printf("[client] crypto wrap error: %v", err)
+			conn.Close()
+			return nil
+		}
+		return cryptConn
+	})
+
+	// 检查是否有连接失败
+	for i, conn := range bundle {
+		if conn == nil {
+			log.Printf("[client] tunnel %d failed during setup", i)
+			// 关闭所有连接
+			for _, c := range bundle {
+				if c != nil {
+					c.Close()
+				}
+			}
+			return nil, err
+		}
+	}
+
+	// 创建 MTMux 会话
+	mtmuxCfg := mtmux.DefaultConfig()
+	mtmuxCfg.Tunnels = int32(tunnels)
+
+	mtmuxSession, err := mtmux.Client(bundle, mtmuxCfg)
+	if err != nil {
+		log.Printf("[client] create mtmux session error: %v", err)
+		for _, conn := range bundle {
+			conn.Close()
+		}
+		return nil, err
+	}
+
+	// 启动 MTMux session（带 context）
+	c.mtmuxCtx, c.mtmuxCancel = context.WithCancel(context.Background())
+	mtmuxSession.Start(c.mtmuxCtx)
+
+	// Give MTMux goroutines time to start (inbound, outbound, control handler)
+	time.Sleep(100 * time.Millisecond)
+
+	log.Printf("[client] mtmux mode connected with %d tunnels", tunnels)
+
+	// 返回适配器包装的会话
+	return mux.NewSessionAdapter(mtmuxSession), nil
 }
 
 func (c *Client) authenticate() error {

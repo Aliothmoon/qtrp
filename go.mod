@@ -1,6 +1,6 @@
 module qtrp
 
-go 1.24.0
+go 1.24.1
 
 require (
 	github.com/panjf2000/gnet/v2 v2.9.5
@@ -12,7 +12,10 @@ require (
 	gopkg.in/yaml.v3 v3.0.1
 )
 
+require github.com/goccy/go-json v0.10.5 // indirect
+
 require (
+	github.com/flben233/mtmux v0.3.2
 	github.com/panjf2000/ants/v2 v2.11.3 // indirect
 	github.com/rogpeppe/go-internal v1.14.1 // indirect
 	github.com/valyala/bytebufferpool v1.0.0 // indirect

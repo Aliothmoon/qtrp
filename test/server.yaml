@@ -1,10 +1,10 @@
 # QTRP 服务端配置
 
 # 控制连接监听地址
-bind_addr: "0.0.0.0:7000"
+bind_addr: "127.0.0.1:17000"
 
 # Dashboard 监听地址 (留空禁用)
-dashboard_addr: "0.0.0.0:7500"
+dashboard_addr: ""
 
 # 传输层: net | gnet | quic
 # - net: 标准 TCP (默认)
@@ -47,9 +47,9 @@ auth:
 # 多隧道复用配置 (可选, 实验性功能)
 # 启用后会使用多条并行 TCP 连接进行数据传输,提高吞吐量和 CPU 利用率
 # 注意: 不能与 transport=quic 同时使用 (QUIC 已内置多路复用)
-# mtmux:
-#   enabled: false      # 是否启用多隧道模式 (默认: false)
-#   tunnels: 8          # 并行连接数 (默认: 8, 范围: 1-32)
-#                       # 例如 bind_addr="0.0.0.0:7000" 且 tunnels=8 时
-#                       # 服务器会监听端口 7000-7007
-#                       # 请确保防火墙已开放这些端口
+mtmux:
+  enabled: true      # 是否启用多隧道模式 (默认: false)
+  tunnels: 8          # 并行连接数 (默认: 8, 范围: 1-32)
+                      # 例如 bind_addr="0.0.0.0:7000" 且 tunnels=8 时
+                      # 服务器会监听端口 7000-7007
+                      # 请确保防火墙已开放这些端口

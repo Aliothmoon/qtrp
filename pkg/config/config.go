@@ -33,6 +33,12 @@ type ServerConfig struct {
 	Auth struct {
 		Tokens []string `yaml:"tokens"`
 	} `yaml:"auth"`
+
+	// MTMux 多隧道复用配置
+	MTMux struct {
+		Enabled bool `yaml:"enabled"` // 启用多隧道模式
+		Tunnels int  `yaml:"tunnels"` // 并行连接数 (默认 8)
+	} `yaml:"mtmux"`
 }
 
 // ClientConfig 客户端配置
@@ -54,6 +60,12 @@ type ClientConfig struct {
 	QUIC struct {
 		SkipVerify bool `yaml:"skip_verify"` // 跳过证书验证（自签名证书需要）
 	} `yaml:"quic"`
+
+	// MTMux 多隧道复用配置
+	MTMux struct {
+		Enabled bool `yaml:"enabled"` // 启用多隧道模式 (必须与服务端一致)
+		Tunnels int  `yaml:"tunnels"` // 并行连接数 (必须与服务端一致, 默认 8)
+	} `yaml:"mtmux"`
 
 	Proxies []ProxyConfig `yaml:"proxies"`
 }
@@ -200,6 +212,19 @@ func LoadServerConfig(path string) (*ServerConfig, error) {
 		cfg.Crypto = "tls"
 	}
 
+	// MTMux 默认值和验证
+	if cfg.MTMux.Enabled {
+		if cfg.MTMux.Tunnels <= 0 {
+			cfg.MTMux.Tunnels = 8 // 默认 8 条隧道
+		}
+		if cfg.MTMux.Tunnels > 32 {
+			return nil, fmt.Errorf("mtmux.tunnels cannot exceed 32 (got %d)", cfg.MTMux.Tunnels)
+		}
+		if cfg.Transport == "quic" {
+			return nil, fmt.Errorf("mtmux cannot be used with transport=quic (QUIC has built-in multiplexing)")
+		}
+	}
+
 	return &cfg, nil
 }
 
@@ -221,6 +246,19 @@ func LoadClientConfig(path string) (*ClientConfig, error) {
 	}
 	if cfg.Crypto == "" {
 		cfg.Crypto = "tls"
+	}
+
+	// MTMux 默认值和验证
+	if cfg.MTMux.Enabled {
+		if cfg.MTMux.Tunnels <= 0 {
+			cfg.MTMux.Tunnels = 8 // 默认 8 条隧道
+		}
+		if cfg.MTMux.Tunnels > 32 {
+			return nil, fmt.Errorf("mtmux.tunnels cannot exceed 32 (got %d)", cfg.MTMux.Tunnels)
+		}
+		if cfg.Transport == "quic" {
+			return nil, fmt.Errorf("mtmux cannot be used with transport=quic (QUIC has built-in multiplexing)")
+		}
 	}
 
 	return &cfg, nil

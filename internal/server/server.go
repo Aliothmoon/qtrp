@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"io"
 	"log"
 	"net"
@@ -16,6 +17,8 @@ import (
 	"qtrp/pkg/protocol"
 	"qtrp/pkg/stats"
 	"qtrp/pkg/transport"
+
+	"github.com/flben233/mtmux"
 )
 
 // Server 服务端
@@ -25,6 +28,9 @@ type Server struct {
 	crypt    crypto.Crypto
 	auth     *auth.Authenticator
 	listener transport.Listener
+
+	// MTMux 相关
+	mtmuxListener *mtmux.Listener
 
 	clients sync.Map // clientID -> *Client
 	proxies sync.Map // remotePort -> *Proxy
@@ -36,10 +42,14 @@ type Server struct {
 // Client 客户端连接
 type Client struct {
 	id       string
-	session  *mux.Session
+	session  mux.SessionInterface // 使用接口以支持 smux 和 mtmux
 	proxies  map[string]*Proxy
 	lastPing time.Time
 	mu       sync.RWMutex
+
+	// MTMux 相关
+	mtmuxCtx    context.Context
+	mtmuxCancel context.CancelFunc
 }
 
 // Proxy 代理
@@ -124,6 +134,14 @@ func New(cfg *config.ServerConfig) *Server {
 
 // Start 启动服务端
 func (s *Server) Start() error {
+	if s.config.MTMux.Enabled {
+		return s.startWithMTMux()
+	}
+	return s.startStandard()
+}
+
+// startStandard 标准模式启动（单连接 + smux）
+func (s *Server) startStandard() error {
 	ln, err := s.trans.Listen(s.config.BindAddr)
 	if err != nil {
 		return err
@@ -150,7 +168,44 @@ func (s *Server) Start() error {
 			}
 		}
 		s.wg.Add(1)
-		go s.handleConnection(conn)
+		go s.handleConnectionStandard(conn)
+	}
+}
+
+// startWithMTMux MTMux 模式启动（多隧道）
+func (s *Server) startWithMTMux() error {
+	tunnels := s.config.MTMux.Tunnels
+	log.Printf("[server] starting mtmux listener on %s with %d tunnels",
+		s.config.BindAddr, tunnels)
+
+	ln, err := mtmux.Listen("tcp", s.config.BindAddr, tunnels)
+	if err != nil {
+		return err
+	}
+	s.mtmuxListener = ln
+
+	log.Printf("[server] mtmux listening on ports %s (transport=%s, crypto=%s, tunnels=%d)",
+		s.config.BindAddr, s.trans.Type(), s.crypt.Type(), tunnels)
+
+	// 启动 Dashboard
+	if s.config.DashboardAddr != "" {
+		go s.startDashboard(s.config.DashboardAddr)
+	}
+
+	// 接受连接
+	for {
+		bundle, err := ln.Accept()
+		if err != nil {
+			select {
+			case <-s.closeCh:
+				return nil
+			default:
+				log.Printf("[server] mtmux accept error: %v", err)
+				continue
+			}
+		}
+		s.wg.Add(1)
+		go s.handleConnectionMTMux(bundle)
 	}
 }
 
@@ -159,6 +214,9 @@ func (s *Server) Stop() error {
 	close(s.closeCh)
 	if s.listener != nil {
 		s.listener.Close()
+	}
+	if s.mtmuxListener != nil {
+		s.mtmuxListener.Close()
 	}
 	// 关闭所有代理
 	s.proxies.Range(func(key, value interface{}) bool {
@@ -170,12 +228,12 @@ func (s *Server) Stop() error {
 	return nil
 }
 
-func (s *Server) handleConnection(conn transport.Conn) {
+func (s *Server) handleConnectionStandard(conn transport.Conn) {
 	defer s.wg.Done()
 
 	defer func() {
 		if err := recover(); err != nil {
-			log.Printf("[server] painc error with handleConnection %v", err)
+			log.Printf("[server] panic error with handleConnectionStandard %v", err)
 		}
 	}()
 
@@ -193,7 +251,7 @@ func (s *Server) handleConnection(conn transport.Conn) {
 		return
 	}
 
-	// 创建多路复用会话
+	// 创建 smux 会话
 	session, err := mux.NewServerSession(cryptConn)
 	if err != nil {
 		log.Printf("[server] mux session error: %v", err)
@@ -221,7 +279,7 @@ func (s *Server) handleConnection(conn transport.Conn) {
 	stats.IncActiveClients()
 	defer stats.DecActiveClients()
 
-	log.Printf("[server] client %s authenticated from %s", client.id, session.RemoteAddr())
+	log.Printf("[server] client %s authenticated (standard mode)", client.id)
 
 	// 处理控制消息
 	s.handleControlStream(client, ctrlStream)
@@ -232,7 +290,110 @@ func (s *Server) handleConnection(conn transport.Conn) {
 	session.Close()
 }
 
-func (s *Server) handleAuth(stream net.Conn, session *mux.Session) (*Client, error) {
+// handleConnectionMTMux 处理 MTMux 连接
+func (s *Server) handleConnectionMTMux(bundle []net.Conn) {
+	defer s.wg.Done()
+
+	defer func() {
+		if err := recover(); err != nil {
+			log.Printf("[server] panic error with handleConnectionMTMux %v", err)
+		}
+	}()
+
+	log.Printf("[server] received %d tunnels, applying encryption and TCP optimization", len(bundle))
+
+	// 对每个连接应用 TCP 优化和加密
+	bundle = mtmux.ConnWrapper(bundle, func(conn net.Conn) net.Conn {
+		// 优化 TCP 参数
+		if err := pool.OptimizeTCPConn(conn); err != nil {
+			log.Printf("[server] optimize TCP params error: %v", err)
+		}
+
+		// 加密包装
+		cryptConn, err := s.crypt.WrapConn(conn, true)
+		if err != nil {
+			log.Printf("[server] crypto wrap error: %v", err)
+			conn.Close()
+			return nil
+		}
+		return cryptConn
+	})
+
+	// 检查是否有连接失败
+	for i, conn := range bundle {
+		if conn == nil {
+			log.Printf("[server] tunnel %d failed during setup", i)
+			// 关闭所有连接
+			for _, c := range bundle {
+				if c != nil {
+					c.Close()
+				}
+			}
+			return
+		}
+	}
+
+	// 创建 MTMux 会话
+	mtmuxCfg := mtmux.DefaultConfig()
+	mtmuxCfg.Tunnels = int32(s.config.MTMux.Tunnels)
+
+	mtmuxSession, err := mtmux.Server(bundle, mtmuxCfg)
+	if err != nil {
+		log.Printf("[server] create mtmux session error: %v", err)
+		for _, conn := range bundle {
+			conn.Close()
+		}
+		return
+	}
+
+	// 启动 MTMux session（带 context）
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	mtmuxSession.Start(ctx)
+
+	// Give MTMux goroutines time to start (inbound, outbound, control handler)
+	time.Sleep(100 * time.Millisecond)
+
+	// 包装为 SessionInterface
+	session := mux.NewSessionAdapter(mtmuxSession)
+
+	// 等待控制流
+	ctrlStream, err := session.AcceptStream()
+	if err != nil {
+		log.Printf("[server] accept control stream error: %v", err)
+		session.Close()
+		return
+	}
+
+	// 处理认证
+	client, err := s.handleAuth(ctrlStream, session)
+	if err != nil {
+		log.Printf("[server] auth error: %v", err)
+		ctrlStream.Close()
+		session.Close()
+		return
+	}
+
+	// 保存 MTMux context 和 cancel 函数
+	client.mtmuxCtx = ctx
+	client.mtmuxCancel = cancel
+
+	stats.IncActiveClients()
+	defer stats.DecActiveClients()
+
+	log.Printf("[server] client %s authenticated (mtmux mode with %d tunnels)", client.id, s.config.MTMux.Tunnels)
+
+	// 处理控制消息
+	s.handleControlStream(client, ctrlStream)
+
+	// 清理
+	cancel() // 取消 MTMux context
+	s.cleanupClient(client)
+	log.Printf("[server] client %s connection closed", client.id)
+	session.Close()
+}
+
+func (s *Server) handleAuth(stream net.Conn, session mux.SessionInterface) (*Client, error) {
 	msg, err := protocol.RecvMessage(stream)
 	if err != nil {
 		log.Printf("[server] recv auth message error: %v", err)
